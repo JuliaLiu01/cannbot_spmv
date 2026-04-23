@@ -40,6 +40,7 @@ struct SpmvTilingData {
     uint32_t cols;
     uint32_t nnz;
     uint32_t rowPtrTileRows;
+    uint64_t blockRowRanges;
 };
 
 struct SpmvBlockProfile {
@@ -49,6 +50,7 @@ struct SpmvBlockProfile {
     uint32_t nnzCount;
     uint32_t chunkCount;
     uint32_t useWindowCount;
+    uint32_t shortRowCount;
 };
 
 constexpr uint32_t kRowPtrTileRows = 128;
@@ -65,12 +67,18 @@ struct ProfileSummary {
     uint64_t totalChunks;
     uint64_t useWindowChunks;
     uint64_t totalProfiledNnz;
+    uint64_t totalShortRows;
     uint32_t blockRowsMin;
     uint32_t blockRowsMax;
     double blockRowsAvg;
     uint32_t blockNnzMin;
     uint32_t blockNnzMax;
     double blockNnzAvg;
+};
+
+struct BlockRowRange {
+    uint32_t rowStart;
+    uint32_t rowEnd;
 };
 
 MatrixProfile BuildMatrixProfile(const sparseMatrix& matrix)
@@ -96,11 +104,10 @@ MatrixProfile BuildMatrixProfile(const sparseMatrix& matrix)
     return profile;
 }
 
-ProfileSummary BuildProfileSummary(const sparseMatrix& matrix, uint32_t blockNum,
-                                   const std::vector<SpmvBlockProfile>& profiles)
+ProfileSummary BuildProfileSummary(const std::vector<SpmvBlockProfile>& profiles)
 {
     ProfileSummary summary {};
-    if (blockNum == 0) {
+    if (profiles.empty()) {
         return summary;
     }
 
@@ -108,27 +115,21 @@ ProfileSummary BuildProfileSummary(const sparseMatrix& matrix, uint32_t blockNum
     summary.blockNnzMin = std::numeric_limits<uint32_t>::max();
     uint64_t totalRows = 0;
     uint64_t totalNnz = 0;
-    for (uint32_t blockIdx = 0; blockIdx < blockNum; ++blockIdx) {
-        if (blockIdx < profiles.size()) {
-            summary.totalChunks += profiles[blockIdx].chunkCount;
-            summary.useWindowChunks += profiles[blockIdx].useWindowCount;
-        }
-
-        const uint32_t rowStart = static_cast<uint32_t>(static_cast<uint64_t>(matrix.row) * blockIdx / blockNum);
-        const uint32_t rowEnd = static_cast<uint32_t>(static_cast<uint64_t>(matrix.row) * (blockIdx + 1) / blockNum);
-        const uint32_t rowCount = rowEnd - rowStart;
-        const uint32_t nnzCount = static_cast<uint32_t>(matrix.rowPtr[rowEnd] - matrix.rowPtr[rowStart]);
-        summary.blockRowsMin = std::min(summary.blockRowsMin, rowCount);
-        summary.blockRowsMax = std::max(summary.blockRowsMax, rowCount);
-        summary.blockNnzMin = std::min(summary.blockNnzMin, nnzCount);
-        summary.blockNnzMax = std::max(summary.blockNnzMax, nnzCount);
-        totalRows += rowCount;
-        totalNnz += nnzCount;
+    for (const SpmvBlockProfile& profile : profiles) {
+        summary.totalChunks += profile.chunkCount;
+        summary.useWindowChunks += profile.useWindowCount;
+        summary.totalShortRows += profile.shortRowCount;
+        summary.blockRowsMin = std::min(summary.blockRowsMin, profile.rowCount);
+        summary.blockRowsMax = std::max(summary.blockRowsMax, profile.rowCount);
+        summary.blockNnzMin = std::min(summary.blockNnzMin, profile.nnzCount);
+        summary.blockNnzMax = std::max(summary.blockNnzMax, profile.nnzCount);
+        totalRows += profile.rowCount;
+        totalNnz += profile.nnzCount;
     }
 
     summary.totalProfiledNnz = totalNnz;
-    summary.blockRowsAvg = static_cast<double>(totalRows) / blockNum;
-    summary.blockNnzAvg = static_cast<double>(totalNnz) / blockNum;
+    summary.blockRowsAvg = static_cast<double>(totalRows) / profiles.size();
+    summary.blockNnzAvg = static_cast<double>(totalNnz) / profiles.size();
     if (summary.blockRowsMin == std::numeric_limits<uint32_t>::max()) {
         summary.blockRowsMin = 0;
     }
@@ -137,7 +138,49 @@ ProfileSummary BuildProfileSummary(const sparseMatrix& matrix, uint32_t blockNum
     }
     return summary;
 }
-// 数据与输出路径（按环境修改）
+
+std::vector<BlockRowRange> BuildBalancedRowRanges(const sparseMatrix& matrix, uint32_t blockNum)
+{
+    std::vector<BlockRowRange> ranges(blockNum, {0, 0});
+    if (blockNum == 0 || matrix.row <= 0) {
+        return ranges;
+    }
+
+    const uint64_t totalNnz = static_cast<uint64_t>(matrix.numElements);
+    const uint64_t targetNnzPerBlock = std::max<uint64_t>(1, (totalNnz + blockNum - 1) / blockNum);
+    uint32_t currentBlock = 0;
+    uint32_t rowStart = 0;
+    uint64_t accumulatedNnz = 0;
+
+    for (uint32_t row = 0; row < static_cast<uint32_t>(matrix.row); ++row) {
+        const uint32_t rowNnz = static_cast<uint32_t>(matrix.rowPtr[row + 1] - matrix.rowPtr[row]);
+        const uint64_t nextAccumulatedNnz = accumulatedNnz + rowNnz;
+        const uint32_t remainingRows = static_cast<uint32_t>(matrix.row) - row;
+        const uint32_t remainingBlocks = blockNum - currentBlock;
+        const bool shouldSplit = currentBlock + 1 < blockNum
+            && row >= rowStart
+            && accumulatedNnz > 0
+            && nextAccumulatedNnz > targetNnzPerBlock
+            && remainingRows >= remainingBlocks;
+        if (shouldSplit) {
+            ranges[currentBlock] = {rowStart, row};
+            ++currentBlock;
+            rowStart = row;
+            accumulatedNnz = 0;
+        }
+        accumulatedNnz += rowNnz;
+    }
+
+    if (currentBlock < blockNum) {
+        ranges[currentBlock] = {rowStart, static_cast<uint32_t>(matrix.row)};
+        ++currentBlock;
+    }
+    while (currentBlock < blockNum) {
+        ranges[currentBlock] = {static_cast<uint32_t>(matrix.row), static_cast<uint32_t>(matrix.row)};
+        ++currentBlock;
+    }
+    return ranges;
+}
 constexpr char kDatasetDir[] = "/home/Hans49_original/";//lp文件的存储路径
 constexpr char kVectorDir[] = "/workspace/data/shared/gen_x/";//x的存储路径
 constexpr char kGoldenDir[] = "/workspace/data/shared/cu64f_result/"; //gpu上FP64精度下的计算结果 y=Ax
@@ -248,8 +291,10 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     const size_t valuesBytes = static_cast<size_t>(matrix.numElements) * sizeof(float);
     const size_t xBytes = static_cast<size_t>(matrix.col) * sizeof(float);
     const size_t yBytes = static_cast<size_t>(matrix.row) * sizeof(float);
+    const std::vector<BlockRowRange> blockRowRanges = BuildBalancedRowRanges(matrix, blockNum);
+    const size_t blockRowRangesBytes = static_cast<size_t>(blockNum) * sizeof(BlockRowRange);
     const size_t profileBytes = static_cast<size_t>(blockNum) * sizeof(SpmvBlockProfile);
-    const size_t profileScalarCount = static_cast<size_t>(blockNum) * 6;
+    const size_t profileScalarCount = static_cast<size_t>(blockNum) * 7;
     std::vector<float> output(static_cast<size_t>(matrix.row), 0.0f);
     std::vector<uint32_t> hostProfileScalars(profileScalarCount, 0);
     std::vector<SpmvBlockProfile> hostProfiles(blockNum);
@@ -259,6 +304,7 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     float* devValues = nullptr;
     float* devX = nullptr;
     float* devY = nullptr;
+    BlockRowRange* devBlockRowRanges = nullptr;
     SpmvTilingData* devTiling = nullptr;
     SpmvBlockProfile* devProfile = nullptr;
     aclrtMalloc(reinterpret_cast<void**>(&devRowPtr), rowPtrBytes, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -266,11 +312,13 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     aclrtMalloc(reinterpret_cast<void**>(&devValues), valuesBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     aclrtMalloc(reinterpret_cast<void**>(&devX), xBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     aclrtMalloc(reinterpret_cast<void**>(&devY), yBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>(&devBlockRowRanges), blockRowRangesBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     aclrtMalloc(reinterpret_cast<void**>(&devTiling), sizeof(SpmvTilingData), ACL_MEM_MALLOC_HUGE_FIRST);
     aclrtMalloc(reinterpret_cast<void**>(&devProfile), profileBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     const auto freeDeviceBuffers = [&]() {
         aclrtFree(devProfile);
         aclrtFree(devTiling);
+        aclrtFree(devBlockRowRanges);
         aclrtFree(devY);
         aclrtFree(devX);
         aclrtFree(devValues);
@@ -284,12 +332,14 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     tiling.cols = static_cast<uint32_t>(matrix.col);
     tiling.nnz = static_cast<uint32_t>(matrix.numElements);
     tiling.rowPtrTileRows = kRowPtrTileRows;
+    tiling.blockRowRanges = reinterpret_cast<uint64_t>(devBlockRowRanges);
 
     aclrtMemcpy(devRowPtr, rowPtrBytes, matrix.rowPtr, rowPtrBytes, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(devColIdx, colIdxBytes, matrix.colIndex, colIdxBytes, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(devValues, valuesBytes, matrix.value, valuesBytes, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(devX, xBytes, x.data(), xBytes, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(devY, yBytes, output.data(), yBytes, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtMemcpy(devBlockRowRanges, blockRowRangesBytes, blockRowRanges.data(), blockRowRangesBytes, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(devTiling, sizeof(SpmvTilingData), &tiling, sizeof(SpmvTilingData), ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemset(devProfile, profileBytes, 0, profileBytes);
 
@@ -301,13 +351,14 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     aclrtMemcpy(output.data(), yBytes, devY, yBytes, ACL_MEMCPY_DEVICE_TO_HOST);
     aclrtMemcpy(hostProfileScalars.data(), profileBytes, devProfile, profileBytes, ACL_MEMCPY_DEVICE_TO_HOST);
     for (uint32_t i = 0; i < blockNum; ++i) {
-        const size_t base = static_cast<size_t>(i) * 6;
+        const size_t base = static_cast<size_t>(i) * 7;
         hostProfiles[i].rowStart = hostProfileScalars[base + 0];
         hostProfiles[i].rowEnd = hostProfileScalars[base + 1];
         hostProfiles[i].rowCount = hostProfileScalars[base + 2];
         hostProfiles[i].nnzCount = hostProfileScalars[base + 3];
         hostProfiles[i].chunkCount = hostProfileScalars[base + 4];
         hostProfiles[i].useWindowCount = hostProfileScalars[base + 5];
+        hostProfiles[i].shortRowCount = hostProfileScalars[base + 6];
     }
 
     double err2 = 0.0;
@@ -318,6 +369,9 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
 
     std::chrono::microseconds totalDuration(0);
     for (int iter = 0; iter < kRepeatTimes; ++iter) {
+        std::fill(output.begin(), output.end(), 0.0f);
+        aclrtMemcpy(devY, yBytes, output.data(), yBytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        aclrtMemset(devProfile, profileBytes, 0, profileBytes);
         const auto start = std::chrono::high_resolution_clock::now();
         LaunchSpmvKernel(blockNum, stream,
             reinterpret_cast<uintptr_t>(devRowPtr), reinterpret_cast<uintptr_t>(devColIdx),
@@ -328,7 +382,7 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
         totalDuration += std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     }
 
-    const ProfileSummary profileSummary = BuildProfileSummary(matrix, blockNum, hostProfiles);
+    const ProfileSummary profileSummary = BuildProfileSummary(hostProfiles);
     const double useWindowRatio = profileSummary.totalChunks == 0
         ? 0.0
         : static_cast<double>(profileSummary.useWindowChunks) / profileSummary.totalChunks;
@@ -338,6 +392,7 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     std::cout << "rows=" << matrix.row
               << ", cols=" << matrix.col
               << ", nnz=" << matrix.numElements
+              << ", blocks=" << blockNum
               << ", avg_kernel_only_us=" << totalDuration.count() / kRepeatTimes
               << ", err=" << err2
               << ", avg_nnz_per_row=" << matrixProfile.avgNnzPerRow
@@ -346,6 +401,7 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
     std::cout << "profile total_chunks=" << profileSummary.totalChunks
               << ", use_window_ratio=" << useWindowRatio
               << ", profiled_nnz=" << profileSummary.totalProfiledNnz
+              << ", total_short_rows=" << profileSummary.totalShortRows
               << ", block_rows[min,max,avg]=[" << profileSummary.blockRowsMin
               << ',' << profileSummary.blockRowsMax
               << ',' << profileSummary.blockRowsAvg << "]"
@@ -363,6 +419,7 @@ void RunSingleMpsCase(const std::string& filename, aclrtStream stream, uint32_t 
               << profileSummary.totalChunks << ','
               << useWindowRatio << ','
               << profileSummary.totalProfiledNnz << ','
+              << profileSummary.totalShortRows << ','
               << profileSummary.blockRowsMin << ','
               << profileSummary.blockRowsMax << ','
               << profileSummary.blockRowsAvg << ','
@@ -399,6 +456,10 @@ int Test(aclrtStream stream, uint32_t blockNum)
 void Analysis(aclrtStream stream, uint32_t blockNum)
 {
     const std::vector<std::string> kCases = {
+        // "degme.mps",
+        // "thk_63.mps",
+        // "stp3d.mps",
+        
         //---vect慢
         "cont1.mps",// 939
         "neos.mps",//1704
@@ -431,11 +492,11 @@ int main(int argc, char* argv[])
     aclrtCreateStream(&stream);
 
     std::ofstream csv(kCsvPath, std::ios::trunc);
-    csv << "name,time,err,avg_nnz_per_row,max_nnz_per_row,short_row_ratio,total_chunks,use_window_ratio,profiled_nnz,block_rows_min,block_rows_max,block_rows_avg,block_nnz_min,block_nnz_max,block_nnz_avg\n";
+    csv << "name,time,err,avg_nnz_per_row,max_nnz_per_row,short_row_ratio,total_chunks,use_window_ratio,profiled_nnz,total_short_rows,block_rows_min,block_rows_max,block_rows_avg,block_nnz_min,block_nnz_max,block_nnz_avg\n";
     csv.close();
 
     Analysis(stream, blockNum);
-    // Test(stream, blockNum)；
+    // Test(stream, blockNum);
 
     aclrtDestroyStream(stream);
     aclrtResetDevice(deviceId);
